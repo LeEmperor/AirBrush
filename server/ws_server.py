@@ -1,6 +1,6 @@
 """WebSocket pose server + static file server for the web client.
 
-Uses `websockets` (lightweight async WS). Static files are served via the
+Uses `websockets` 12–13.x legacy API. Static files are served via the
 process_request hook — any non-/ws path gets served from the /web/ directory.
 """
 
@@ -14,7 +14,6 @@ from pathlib import Path
 from http import HTTPStatus
 
 import websockets
-from websockets import Headers, Response
 
 import config
 
@@ -30,30 +29,35 @@ WEB_ROOT = Path(config.WEB_DIR)
 MIME_EXTRA = {".js": "application/javascript", ".mjs": "application/javascript"}
 
 
-def _serve_static(path: str):
-    """Return a Response for a static file, or None to pass through to WS."""
+async def _process_request(path, request_headers):
+    """process_request hook (websockets 12-13 legacy API).
+
+    Receives (path: str, headers).
+    Return (HTTPStatus, [(name, value), ...], body_bytes) to send HTTP.
+    Return None to proceed with the WebSocket handshake.
+    """
     if path.startswith("/ws"):
-        return None
+        return None  # let websockets handle the upgrade
 
     if path in ("", "/"):
         path = "/index.html"
 
     fp = (WEB_ROOT / path.lstrip("/")).resolve()
     if not str(fp).startswith(str(WEB_ROOT)):
-        return Response(403, "Forbidden", Headers(), b"Forbidden")
+        return HTTPStatus.FORBIDDEN, [], b"Forbidden"
     if not fp.is_file():
-        return Response(404, "Not Found", Headers(), b"Not Found")
+        return HTTPStatus.NOT_FOUND, [], b"Not Found"
 
     ct = MIME_EXTRA.get(fp.suffix,
                         mimetypes.guess_type(str(fp))[0] or
                         "application/octet-stream")
     body = fp.read_bytes()
-    headers = Headers([
+    headers = [
         ("Content-Type", ct),
         ("Content-Length", str(len(body))),
         ("Cache-Control", "no-cache"),
-    ])
-    return Response(200, "OK", headers, body)
+    ]
+    return HTTPStatus.OK, headers, body
 
 
 # ── WebSocket handler ──────────────────────────────────────────────────────
@@ -136,14 +140,10 @@ class JsonPoseHandler:
             controller.arm()
 
 
-async def _handler(ws):
+async def _handler(ws, path=None):
+    """Top-level handler passed to websockets.serve."""
     h = JsonPoseHandler(ws)
     await h.run()
-
-
-def _process_request(connection, request):
-    """process_request hook for websockets.serve — serves static files."""
-    return _serve_static(request.path)
 
 
 async def start(host=None, port=None):
