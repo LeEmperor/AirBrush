@@ -13,4 +13,4 @@ class SensorType(Enum):
     MMC5603x_MAGNETOMETER_UNCALIBRATED = "android.sensor.magnetic_field_uncalibrated"
     GAME_ROTATION_VECTOR = "android.sensor.game_rotation_vector"
     ICM4X6XX_GYROSCOPE_UNCALIBRATED = "android.sensor.gyroscope_uncalibrated"
-    PEDOMETER_WAKEUP = "android.sensor.step_detect"
+    PEDOMETER_WAKEUP = "android.sensor.step_detector"
