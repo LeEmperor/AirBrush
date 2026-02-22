@@ -1,6 +1,7 @@
 #include <Arduino.h>
 
-#define BAUDRATE 115200
+#define BAUD_USB 115200
+#define BAUD_SISTER 115200
 
 #define PACKET_DELIMITER 0xF0F0
 #define HEARTBEAT_PACKET_ID 0x00
@@ -9,7 +10,12 @@
 #define DAC1_PIN 25
 #define DAC2_PIN 26
 
-#define MAX_PACKET_SIZE 12   // largest possible packet
+#define SISTER_TX 17
+#define SISTER_RX 16
+
+#define MAX_PACKET_SIZE 12
+
+HardwareSerial SisterSerial(1);
 
 enum ParseState {
   WAIT_HEADER_1,
@@ -29,21 +35,31 @@ uint16_t packet_id = 0;
 void resetParser() {
   state = WAIT_HEADER_1;
   indexPos = 0;
-  expectedLength = 0;
+}
+
+void forwardToSister(uint8_t c3, uint8_t c4) {
+  SisterSerial.write(0xAA);
+  SisterSerial.write(0x55);
+  SisterSerial.write(c3);
+  SisterSerial.write(c4);
 }
 
 void processPacket() {
+
   if (packet_id == CONTROL_PACKET_ID) {
-    uint8_t control1 = buffer[4];
-    uint8_t control2 = buffer[5];
 
-    dacWrite(DAC1_PIN, control1);
-    dacWrite(DAC2_PIN, control2);
+    uint8_t c1 = buffer[4];
+    uint8_t c2 = buffer[5];
+    uint8_t c3 = buffer[6];
+    uint8_t c4 = buffer[7];
 
-    Serial.printf("Control1: %d  Control2: %d\n", control1, control2);
-  }
-  else if (packet_id == HEARTBEAT_PACKET_ID) {
-    Serial.println("Heartbeat received");
+    dacWrite(DAC1_PIN, c1);
+    dacWrite(DAC2_PIN, c2);
+
+    forwardToSister(c3, c4);
+
+    Serial.printf("Main -> C1:%d C2:%d | Forwarded C3:%d C4:%d\n",
+                  c1, c2, c3, c4);
   }
 }
 
@@ -62,9 +78,7 @@ void parseByte(uint8_t byteIn) {
       if (byteIn == 0xF0) {
         buffer[1] = byteIn;
         state = READ_ID_1;
-      } else {
-        state = WAIT_HEADER_1;
-      }
+      } else state = WAIT_HEADER_1;
       break;
 
     case READ_ID_1:
@@ -75,41 +89,20 @@ void parseByte(uint8_t byteIn) {
     case READ_ID_2:
       buffer[3] = byteIn;
       packet_id = buffer[2] | (buffer[3] << 8);
-
-      if (packet_id == HEARTBEAT_PACKET_ID) {
-        expectedLength = 8;
-      }
-      else if (packet_id == CONTROL_PACKET_ID) {
-        expectedLength = 12;
-      }
-      else {
-        resetParser(); // unknown packet
-        break;
-      }
-
+      expectedLength = (packet_id == CONTROL_PACKET_ID) ? 12 : 8;
       indexPos = 4;
       state = READ_REST;
       break;
 
     case READ_REST:
       buffer[indexPos++] = byteIn;
-
       if (indexPos >= expectedLength) {
-
-        uint16_t footer_id =
-          buffer[expectedLength - 4] |
-          (buffer[expectedLength - 3] << 8);
-
-        uint16_t footer_delim =
-          buffer[expectedLength - 2] |
-          (buffer[expectedLength - 1] << 8);
-
-        if (footer_delim == PACKET_DELIMITER &&
-            footer_id == packet_id) {
-
+        uint16_t footer =
+          buffer[expectedLength-2] |
+          (buffer[expectedLength-1] << 8);
+        if (footer == PACKET_DELIMITER) {
           processPacket();
         }
-
         resetParser();
       }
       break;
@@ -117,13 +110,14 @@ void parseByte(uint8_t byteIn) {
 }
 
 void setup() {
-  Serial.begin(BAUDRATE);
-  delay(1000);
+
+  Serial.begin(BAUD_USB);
+  SisterSerial.begin(BAUD_SISTER, SERIAL_8N1, SISTER_RX, SISTER_TX);
 
   pinMode(DAC1_PIN, OUTPUT);
   pinMode(DAC2_PIN, OUTPUT);
 
-  Serial.println("ESP32 Receiver Ready");
+  Serial.println("Main ESP32 Ready");
 }
 
 void loop() {
