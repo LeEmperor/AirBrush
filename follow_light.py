@@ -64,19 +64,12 @@ while cap.isOpened():
                 blended_image = frame
 
 
-            x = cv2.bitwise_or(frame, frame, mask=thresh_bright)
+            x = cv2.bitwise_and(frame, frame, mask=thresh_bright)
 
-            blended_image = cv2.addWeighted(blended_image, 1, x, beta, gamma)
+            # blended_image = cv2.addWeighted(blended_image, 1, x, 1, 0)
+            blended_image = cv2.add(blended_image, x)
 
             cv2.imshow("Frame", blended_image)
-
-
-
-
-
-
-
-
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
