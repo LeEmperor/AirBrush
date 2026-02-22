@@ -1,4 +1,4 @@
-import asyncio
+# server.py
 import inspect
 import json
 import math
@@ -13,22 +13,31 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 PoseCallback = Callable[[dict[str, Any], WebSocket], Any]
 
-# Send: uint64 t_ms + 16 float32 (row-major)
-HEAD = struct.Struct("<Q")  # 8 bytes
+# --- Binary packet formats over ZMQ ---
+# 1-byte packet type + uint64 timestamp + payload
+# Pose:  b'P' + <Q> + 16 float32 row-major (64 bytes)
+# Event: b'E' + <Q> + <c> (1 byte event code)
+PKT_TYPE = struct.Struct("<c")
+U64 = struct.Struct("<Q")
+EVT = struct.Struct("<c")
 
 
-class ZmqPosePublisher:
+class ZmqPublisher:
     def __init__(self, bind_addr: str = "tcp://127.0.0.1:5556"):
         self._ctx = zmq.asyncio.Context.instance()
         self._sock = self._ctx.socket(zmq.PUB)
         self._sock.bind(bind_addr)
 
-        # Low-latency tuning (optional)
+        # Low-latency tuning
         self._sock.setsockopt(zmq.SNDHWM, 1)
         self._sock.setsockopt(zmq.LINGER, 0)
-        self._sock.setsockopt(zmq.CONFLATE, 1)  # keep only latest on PUB socket
 
-    async def publish_pose_bytes(self, payload: bytes) -> None:
+        # Latest-only: keeps the newest message; older ones may be dropped.
+        # NOTE: If you need events to NEVER be dropped, remove CONFLATE here,
+        # or use a second PUB socket/port for events.
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+
+    async def send(self, payload: bytes) -> None:
         await self._sock.send(payload)
 
     def close(self) -> None:
@@ -38,46 +47,23 @@ class ZmqPosePublisher:
             pass
 
 
-# Latest-only queue (critical to avoid lag)
-pose_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
-publisher = ZmqPosePublisher("tcp://127.0.0.1:5556")
-
-
-async def pump_queue_to_zmq(stop_evt: asyncio.Event):
-    while not stop_evt.is_set():
-        try:
-            payload = await asyncio.wait_for(pose_q.get(), timeout=0.5)
-        except asyncio.TimeoutError:
-            continue
-        await publisher.publish_pose_bytes(payload)
+publisher = ZmqPublisher("tcp://127.0.0.1:5556")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    stop_evt = asyncio.Event()
-    task = asyncio.create_task(pump_queue_to_zmq(stop_evt))
     try:
         yield
     finally:
-        stop_evt.set()
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
         publisher.close()
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-# ----------------------------
-# WebSocket handler
-# ----------------------------
 class PoseWSHandler:
-    def __init__(self, *, on_pose: PoseCallback, max_raw_preview: int = 200, verbose: bool = True):
+    def __init__(self, *, on_pose: PoseCallback, verbose: bool = True):
         self.on_pose = on_pose
-        self.max_raw_preview = max_raw_preview
         self.verbose = verbose
 
     async def handle(self, ws: WebSocket) -> None:
@@ -89,6 +75,7 @@ class PoseWSHandler:
             while True:
                 msg = await ws.receive_text()
                 await self._on_message(ws, msg)
+
         except WebSocketDisconnect:
             if self.verbose:
                 print("❌ Phone disconnected")
@@ -97,30 +84,50 @@ class PoseWSHandler:
         try:
             data = json.loads(msg)
         except Exception:
-            if self.verbose:
-                print("RAW (non-JSON):", msg[: self.max_raw_preview])
             return
 
-        if data.get("type") == "pose":
+        mtype = data.get("type")
+        if mtype == "pose":
             await self._call_on_pose(data, ws)
+        elif mtype == "event":
+            await self._handle_event(data)
+        else:
+            # ignore hello/heartbeat/bye
             return
 
     async def _call_on_pose(self, data: dict, ws: WebSocket) -> None:
         try:
-            result = self.on_pose(data, ws)
-            if inspect.isawaitable(result):
-                await result
+            res = self.on_pose(data, ws)
+            if inspect.isawaitable(res):
+                await res
         except Exception as e:
             print("❌ on_pose error:", repr(e))
 
+    async def _handle_event(self, data: dict) -> None:
+        """
+        Receives: {"type":"event","data":"launch"|"land", "t_ms":...}
+        Publishes binary event packet to ZMQ.
+        """
+        name = data.get("data")
+        t_ms = int(data.get("t_ms") or 0)
+
+        if name == "launch":
+            code = b"L"
+        elif name == "land":
+            code = b"D"
+        else:
+            code = b"?"  # unknown event
+
+        payload = PKT_TYPE.pack(b"E") + U64.pack(t_ms) + EVT.pack(code)
+        await publisher.send(payload)
+
 
 def quat_to_rotmat_xyzw(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
-    # Normalize
     n = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
     if n == 0.0:
         return np.eye(3, dtype=np.float32)
-    qx, qy, qz, qw = qx/n, qy/n, qz/n, qw/n
 
+    qx, qy, qz, qw = qx/n, qy/n, qz/n, qw/n
     xx, yy, zz = qx*qx, qy*qy, qz*qz
     xy, xz, yz = qx*qy, qx*qz, qy*qz
     wx, wy, wz = qw*qx, qw*qy, qw*qz
@@ -141,10 +148,12 @@ def pose_to_T_xyzw(px: float, py: float, pz: float, qx: float, qy: float, qz: fl
 
 
 async def transform_to_homogenous_matrix(data: dict[str, Any], ws: WebSocket):
+    """
+    Receives pose JSON from the phone, publishes binary pose packet to ZMQ.
+    """
     p = data.get("pos") or {}
     q = data.get("quat") or {}
 
-    # Fast float parsing (avoid extra formatting)
     def f(v):
         try:
             return float(v)
@@ -159,10 +168,9 @@ async def transform_to_homogenous_matrix(data: dict[str, Any], ws: WebSocket):
     t_ms = int(data.get("t_ms") or 0)
     T = pose_to_T_xyzw(px, py, pz, qx, qy, qz, qw)  # 4x4 float32
 
-    # Build payload: 8-byte timestamp + 64-byte matrix (16 float32)
-    payload = HEAD.pack(t_ms) + T.reshape(16).tobytes()
-    # publish immediately (no queue)
-    await publisher.publish_pose_bytes(payload)
+    # Pose packet: 'P' + t_ms + 16 float32
+    payload = PKT_TYPE.pack(b"P") + U64.pack(t_ms) + T.reshape(16).tobytes()
+    await publisher.send(payload)
 
 
 handler = PoseWSHandler(on_pose=transform_to_homogenous_matrix, verbose=False)

@@ -3,13 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>iPhone WebXR Pose Stream (DOM Overlay, Optimized)</title>
+  <title>iPhone WebXR Pose Stream (Launch/Land + Stop)</title>
   <style>
     body { font-family: system-ui, sans-serif; padding: 16px; margin: 0; }
-
     button { font-size: 16px; padding: 10px 14px; }
     input { width: 100%; padding: 8px; margin: 10px 0; font-size: 14px; box-sizing: border-box; }
-
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
     #log {
@@ -24,37 +22,28 @@
       line-height: 1.35;
     }
 
-    /* ---- DOM overlay container (sits above immersive AR) ---- */
     #overlay {
       position: fixed;
       left: 12px;
       right: 12px;
       top: 12px;
       z-index: 9999;
-
       background: rgba(0,0,0,0.55);
       border: 1px solid rgba(255,255,255,0.15);
       border-radius: 12px;
       padding: 12px;
-
       pointer-events: auto;
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
     }
 
-    #overlay h1 {
-      margin: 0 0 8px 0;
-      font-size: 18px;
-      color: #fff;
-    }
-
+    #overlay h1 { margin: 0 0 8px 0; font-size: 18px; color: #fff; }
     #overlay label { color: #eee; font-size: 14px; }
     #status { color: #eee; font-size: 13px; margin-top: 8px; opacity: 0.9; }
     #hint { color: #ddd; font-size: 12px; margin-top: 6px; opacity: 0.85; }
   </style>
 </head>
 <body>
-
   <div id="overlay">
     <h1>WebXR Pose → WebSocket</h1>
 
@@ -62,18 +51,23 @@
     <input id="wsUrl" value="wss://10.29.177.97:8081/ws" />
 
     <div class="row">
-      <button id="start">Start XR + Stream</button>
+      <button id="toggle">Launch</button>
       <button id="stop" disabled>Stop</button>
     </div>
 
-    <div id="status">Idle.</div>
-    <div id="hint">Optimized: no per-frame "frame" packets, capped log, send-rate control.</div>
+    <div id="status">Idle. Not streaming.</div>
+    <div id="hint">
+      Launch starts streaming + sends one launch event. Land sends one land event (stream continues).
+      Stop ends XR+WS (stops sending).
+    </div>
     <div id="log"></div>
   </div>
 
 <script>
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
+const toggleBtn = document.getElementById('toggle');
+const stopBtn = document.getElementById('stop');
 
 const LOG_MAX_LINES = 40;
 let logLines = [];
@@ -85,31 +79,43 @@ function log(msg) {
 function setStatus(msg) { statusEl.textContent = msg; }
 function nowMs() { return Math.round(performance.now()); }
 
-// ---- state we can clean up on Stop ----
+// ---- state ----
 let ws = null;
 let session = null;
 let gl = null;
 let heartbeatId = null;
-let running = false;
 
-// ---- streaming knobs ----
-// Set to 1 to attempt sending at full XR rate (may be unstable).
-// Set to 2 to send ~30Hz when XR is ~60Hz (recommended for stability).
+let streaming = false; // true once XR+WS are running
+let launched = false;  // only controls the Launch/Land label
+
+// If true, the next frame will NOT send pose (prevents "two packets" on click)
+let skipNextPoseSend = false;
+
 const SEND_EVERY_N_FRAMES = 2;
 
-// FPS meter (on-device)
+// FPS meter
 let fpsLast = performance.now();
 let fpsFrames = 0;
 let fpsEma = 60;
 
-function setUiRunning(isRunning) {
-  running = isRunning;
-  document.getElementById('start').disabled = isRunning;
-  document.getElementById('stop').disabled = !isRunning;
-  setStatus(isRunning ? "Running." : "Idle.");
+function wsOpen() {
+  return ws && ws.readyState === WebSocket.OPEN;
 }
 
-// Stop everything safely (can be called multiple times)
+function updateUi() {
+  toggleBtn.textContent = launched ? "Land" : "Launch";
+  stopBtn.disabled = !streaming;
+  if (!streaming) setStatus("Idle. Not streaming.");
+}
+
+function sendEvent(name) {
+  if (!wsOpen()) return;
+  // Ensure the click only emits ONE packet by skipping pose on the immediately-following frame
+  skipNextPoseSend = true;
+  ws.send(JSON.stringify({ type: "event", data: name, t_ms: nowMs() }));
+  log("Event sent: " + name);
+}
+
 async function stopAll(reason = "stop") {
   log("Stopping: " + reason);
 
@@ -134,28 +140,21 @@ async function stopAll(reason = "stop") {
   }
 
   gl = null;
-  setUiRunning(false);
+  streaming = false;
+  launched = false;
+  skipNextPoseSend = false;
+  updateUi();
   log("Stopped.");
 }
 
-// Stop button
-document.getElementById('stop').onclick = async () => {
-  await stopAll("user_clicked_stop");
-};
-
-document.getElementById('start').onclick = async () => {
-  log("Clicked start.");
+async function startStreaming() {
+  log("Launching: starting XR + WebSocket...");
 
   if (!navigator.xr) {
     log("navigator.xr not found. Open this page inside WebXR Viewer.");
+    await stopAll("no_navigator_xr");
     return;
   }
-
-  if (running) {
-    await stopAll("restart");
-  }
-
-  setUiRunning(true);
 
   // ---- WebSocket ----
   const wsUrl = document.getElementById('wsUrl').value.trim();
@@ -164,6 +163,8 @@ document.getElementById('start').onclick = async () => {
   ws.onopen = () => {
     log("WebSocket connected: " + wsUrl);
     ws.send(JSON.stringify({ type: "hello", t_ms: nowMs() }));
+    // Send exactly ONE packet here: launch event, and skip pose on the next frame.
+    sendEvent("launch");
   };
   ws.onerror = (e) => log("WebSocket error: " + (e?.message || e));
   ws.onclose = () => {
@@ -171,12 +172,9 @@ document.getElementById('start').onclick = async () => {
     stopAll("ws_closed");
   };
 
-  // Heartbeat (keep, but light)
   heartbeatId = setInterval(() => {
     try {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "heartbeat", t_ms: nowMs() }));
-      }
+      if (wsOpen()) ws.send(JSON.stringify({ type: "heartbeat", t_ms: nowMs() }));
     } catch (e) {}
   }, 1000);
 
@@ -186,7 +184,6 @@ document.getElementById('start').onclick = async () => {
     const mode = supportedAR ? "immersive-ar" : "immersive-vr";
     log("Using XR mode: " + mode);
 
-    // Try DOM overlay first
     session = await navigator.xr.requestSession(mode, {
       requiredFeatures: ["local-floor"],
       optionalFeatures: ["local", "dom-overlay"],
@@ -194,25 +191,10 @@ document.getElementById('start').onclick = async () => {
     });
 
     session.addEventListener("end", () => stopAll("xr_session_end_event"));
-
   } catch (e) {
-    log("requestSession with DOM overlay failed: " + e);
-    try {
-      const supportedAR = await navigator.xr.isSessionSupported("immersive-ar").catch(() => false);
-      const mode = supportedAR ? "immersive-ar" : "immersive-vr";
-      log("Retrying without DOM overlay. (UI may not stay visible.)");
-
-      session = await navigator.xr.requestSession(mode, {
-        requiredFeatures: ["local-floor"],
-        optionalFeatures: ["local"]
-      });
-
-      session.addEventListener("end", () => stopAll("xr_session_end_event"));
-    } catch (e2) {
-      log("Failed to start XR session: " + e2);
-      await stopAll("xr_start_failed");
-      return;
-    }
+    log("requestSession failed: " + e);
+    await stopAll("xr_start_failed");
+    return;
   }
 
   // WebGL baseLayer
@@ -234,39 +216,40 @@ document.getElementById('start').onclick = async () => {
     return;
   }
 
-  log("Streaming started.");
+  streaming = true;
+  stopBtn.disabled = false;
+  log("Pose streaming started.");
 
-  let sentPose = 0;
-  let frameCount = 0;
-
-  // reset fps meter
   fpsLast = performance.now();
   fpsFrames = 0;
   fpsEma = 60;
 
-  function onFrame(t, frame) {
-    if (!running || !session) return;
+  let sentPose = 0;
+  let frameCount = 0;
 
-    // FPS meter
+  function onFrame(t, frame) {
+    if (!session || !streaming) return;
+
     fpsFrames++;
     const now = performance.now();
     if (now - fpsLast >= 1000) {
       const fps = fpsFrames * 1000 / (now - fpsLast);
       fpsEma = 0.9 * fpsEma + 0.1 * fps;
-      setStatus(`Running. fps=${fps.toFixed(1)} (ema ${fpsEma.toFixed(1)}) sent=${sentPose}`);
+      setStatus(`Streaming. fps=${fps.toFixed(1)} (ema ${fpsEma.toFixed(1)}) sent=${sentPose}`);
       fpsFrames = 0;
       fpsLast = now;
     }
 
     try {
-      const wsOpen = (ws && ws.readyState === WebSocket.OPEN);
       const pose = frame.getViewerPose(refSpace);
 
-      if (pose && wsOpen) {
+      if (pose && wsOpen()) {
         frameCount++;
 
-        // Send at controlled rate for stability
-        if (frameCount % SEND_EVERY_N_FRAMES === 0) {
+        // If a Launch/Land click just happened, skip sending pose for ONE frame.
+        if (skipNextPoseSend) {
+          skipNextPoseSend = false;
+        } else if (frameCount % SEND_EVERY_N_FRAMES === 0) {
           const tr = pose.views[0].transform;
           ws.send(JSON.stringify({
             type: "pose",
@@ -275,9 +258,7 @@ document.getElementById('start').onclick = async () => {
             quat: { x: tr.orientation.x, y: tr.orientation.y, z: tr.orientation.z, w: tr.orientation.w }
           }));
           sentPose++;
-
-          // Very infrequent logging to avoid DOM overhead
-          if (sentPose % 120 === 0) log("Sent pose frames: " + sentPose);
+          if (sentPose % 240 === 0) log("Sent pose frames: " + sentPose);
         }
       }
 
@@ -289,7 +270,41 @@ document.getElementById('start').onclick = async () => {
   }
 
   session.requestAnimationFrame(onFrame);
+}
+
+// Toggle button:
+// - initial: Launch, nothing sent
+// - click Launch: starts streaming + sends one launch event, label becomes Land
+// - click Land: keeps streaming + sends one land event, label becomes Launch
+toggleBtn.onclick = async () => {
+  toggleBtn.disabled = true;
+  try {
+    if (!streaming) {
+      launched = true; // show Land
+      updateUi();
+      await startStreaming();
+      // if startStreaming failed, stopAll resets state
+    } else {
+      launched = !launched;
+      const evt = launched ? "launch" : "land";
+      sendEvent(evt);
+      updateUi();
+    }
+  } catch (e) {
+    log("Toggle error: " + e);
+  } finally {
+    toggleBtn.disabled = false;
+  }
 };
+
+// Stop button: stop streaming (XR + WS)
+stopBtn.onclick = async () => {
+  stopBtn.disabled = true;
+  await stopAll("user_clicked_stop");
+};
+
+// init
+updateUi();
 </script>
 </body>
 </html>
