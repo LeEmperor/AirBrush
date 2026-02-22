@@ -66,7 +66,7 @@ while cap.isOpened():
 
             x = cv2.bitwise_or(frame, frame, mask=thresh_bright)
 
-            blended_image = cv2.addWeighted(blended_image, alpha, x, beta, gamma)
+            blended_image = cv2.addWeighted(blended_image, 1, x, beta, gamma)
 
             cv2.imshow("Frame", blended_image)
 
