@@ -58,8 +58,9 @@ class ControllerInterface:
                 try:
                     packet = self.packet_queue.get(block=True, timeout=1.0)
                     srl.write(packet)
-                    buf = list(bytearray(srl.read(12)))
-                    print(buf) 
+                    buf = srl.read_all()
+                    if buf:
+                        print(buf.decode('ascii', errors='ignore'), end='')  # Print any incoming data from the controller
                 except queue.Empty:
                     continue
         except Exception as e:
@@ -102,7 +103,7 @@ def main():
         while True:
             # Example control values (replace with actual control logic)
             new_time = time.time()
-            t += 0.01 * (new_time - last_time)
+            t += 0.1 * (new_time - last_time)
             control_values = [
                 int((1 + 0.5 * math.sin(t)) * 127),  # yaw (purple) (0-255)
                 int((1 + 0.5 * math.cos(t)) * 127),  # height (blue) (0-255)
@@ -110,7 +111,7 @@ def main():
                 int((1 + 0.5 * math.cos(2*t)) * 127)  # strafe (yellow) (0-255)
             ]
             controller_interface.control(control_values)
-            # print(controller_interface.read(), end='')  # Read and print any incoming data from the controller
+            print(f"Sent control values: {control_values}")
             last_time = new_time
             time.sleep(1)  # Send control values every second
     except KeyboardInterrupt:
