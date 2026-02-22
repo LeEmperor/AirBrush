@@ -15,6 +15,7 @@ class ControllerState(enum.Enum):
 PACKET_HEADER = '<HH'
 PACKET_FOOTER = '<HH'
 PACKET_DELIMITER = 0xF0F0
+PACKET_DELIMETER_FOOTER = 0x0F0F
 
 HEARTBEAT_PACKET_ID = 0x00
 CONTROL_PACKET_ID = 0x01
@@ -23,8 +24,6 @@ class ControllerInterface:
     def __init__(self, port, baudrate): 
         self.serial = serial.Serial(port, baudrate)
         self.state = ControllerState.IDLE
-        self.packet_buffer = []
-        self.thread = threading.Thread(target=self.broadcast)
         self.heartbeat_thread = threading.Thread(target=self.heartbeat)
         
     def create_packet(self, packet_id: int, payload: bytes) -> bytes:
@@ -37,39 +36,38 @@ class ControllerInterface:
         return packet
 
     def heartbeat(self):
+        print(f"Sending heartbeat packet")
         while self.state == ControllerState.ACTIVE:
             heartbeat_packet = self.create_packet(HEARTBEAT_PACKET_ID, b'')
-            self.packet_buffer.append(heartbeat_packet)
+            self.serial.write(heartbeat_packet)
         time.sleep(0.25)
 
-    def broadcast(self):
-        while self.state == ControllerState.ACTIVE:
-            if self.packet_buffer:
-                packet = self.packet_buffer.pop(0)
-                self.serial.write(packet)
-            time.sleep(0.01)          
-    
     def control(self, control_values: list[int]):
+        print(f"Sending control values: {control_values}")
         assert len(control_values) == 4, "Control packet should have exactly 4 control values"
         payload = struct.pack('<' + 'B' * len(control_values), *control_values)
         control_packet = self.create_packet(CONTROL_PACKET_ID, payload)
-        self.packet_buffer.append(control_packet)
+        self.serial.write(control_packet)
         
     def start(self):
         # Start the controller interface
         self.state = ControllerState.ACTIVE
-        self.thread.start()
         self.heartbeat_thread.start()
         print("Controller interface started.")
 
     def stop(self):
         # Stop the controller interface
         self.state = ControllerState.IDLE
-        self.thread.join()
         self.heartbeat_thread.join()
         self.serial.close()
         print("Controller interface stopped.")
 
+    def read(self) -> str:
+        # Read data from the serial port
+        if self.serial.in_waiting > 0:
+            data = self.serial.read(self.serial.in_waiting)
+            return data.decode('ascii', errors='ignore')
+        return ''
 
 def main(): 
     # Parse command-line arguments
@@ -99,6 +97,7 @@ def main():
                 int((1 + 0.5 * math.cos(2*t)) * 127)  # strafe (yellow) (0-255)
             ]
             controller_interface.control(control_values)
+            # print(controller_interface.read(), end='')  # Read and print any incoming data from the controller
             last_time = new_time
             time.sleep(1)  # Send control values every second
     except KeyboardInterrupt:
