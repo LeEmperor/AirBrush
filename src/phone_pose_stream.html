@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>iPhone WebXR Pose Stream (DOM Overlay)</title>
+  <title>iPhone WebXR Pose Stream (DOM Overlay, Optimized)</title>
   <style>
     body { font-family: system-ui, sans-serif; padding: 16px; margin: 0; }
 
@@ -20,6 +20,8 @@
       border-radius: 8px;
       overflow: auto;
       max-height: 35vh;
+      font-size: 12px;
+      line-height: 1.35;
     }
 
     /* ---- DOM overlay container (sits above immersive AR) ---- */
@@ -30,13 +32,11 @@
       top: 12px;
       z-index: 9999;
 
-      /* readable over camera */
       background: rgba(0,0,0,0.55);
       border: 1px solid rgba(255,255,255,0.15);
       border-radius: 12px;
       padding: 12px;
 
-      /* allow tapping */
       pointer-events: auto;
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
@@ -50,13 +50,11 @@
 
     #overlay label { color: #eee; font-size: 14px; }
     #status { color: #eee; font-size: 13px; margin-top: 8px; opacity: 0.9; }
-
-    /* If DOM overlay isn't active, this is still just normal page UI */
+    #hint { color: #ddd; font-size: 12px; margin-top: 6px; opacity: 0.85; }
   </style>
 </head>
 <body>
 
-  <!-- This is the root for DOM overlay. In immersive-ar, this stays visible. -->
   <div id="overlay">
     <h1>WebXR Pose → WebSocket</h1>
 
@@ -69,13 +67,21 @@
     </div>
 
     <div id="status">Idle.</div>
+    <div id="hint">Optimized: no per-frame "frame" packets, capped log, send-rate control.</div>
     <div id="log"></div>
   </div>
 
 <script>
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
-function log(msg) { logEl.textContent = msg + "\n" + logEl.textContent; }
+
+const LOG_MAX_LINES = 40;
+let logLines = [];
+function log(msg) {
+  logLines.unshift(msg);
+  if (logLines.length > LOG_MAX_LINES) logLines.pop();
+  logEl.textContent = logLines.join("\n");
+}
 function setStatus(msg) { statusEl.textContent = msg; }
 function nowMs() { return Math.round(performance.now()); }
 
@@ -85,6 +91,16 @@ let session = null;
 let gl = null;
 let heartbeatId = null;
 let running = false;
+
+// ---- streaming knobs ----
+// Set to 1 to attempt sending at full XR rate (may be unstable).
+// Set to 2 to send ~30Hz when XR is ~60Hz (recommended for stability).
+const SEND_EVERY_N_FRAMES = 2;
+
+// FPS meter (on-device)
+let fpsLast = performance.now();
+let fpsFrames = 0;
+let fpsEma = 60;
 
 function setUiRunning(isRunning) {
   running = isRunning;
@@ -97,19 +113,16 @@ function setUiRunning(isRunning) {
 async function stopAll(reason = "stop") {
   log("Stopping: " + reason);
 
-  // stop heartbeat
   if (heartbeatId !== null) {
     clearInterval(heartbeatId);
     heartbeatId = null;
   }
 
-  // end XR session (releases camera)
   if (session) {
     try { await session.end(); } catch (e) {}
     session = null;
   }
 
-  // close ws
   if (ws) {
     try {
       if (ws.readyState === WebSocket.OPEN) {
@@ -138,7 +151,6 @@ document.getElementById('start').onclick = async () => {
     return;
   }
 
-  // If already running, restart cleanly
   if (running) {
     await stopAll("restart");
   }
@@ -156,11 +168,10 @@ document.getElementById('start').onclick = async () => {
   ws.onerror = (e) => log("WebSocket error: " + (e?.message || e));
   ws.onclose = () => {
     log("WebSocket closed");
-    // If WS closes unexpectedly, stop XR so camera doesn't stay stuck
     stopAll("ws_closed");
   };
 
-  // Heartbeat so server always sees traffic
+  // Heartbeat (keep, but light)
   heartbeatId = setInterval(() => {
     try {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -175,20 +186,16 @@ document.getElementById('start').onclick = async () => {
     const mode = supportedAR ? "immersive-ar" : "immersive-vr";
     log("Using XR mode: " + mode);
 
-    // Request DOM overlay so the UI stays visible in immersive sessions.
-    // If the runtime doesn't support it, requestSession may fail.
+    // Try DOM overlay first
     session = await navigator.xr.requestSession(mode, {
       requiredFeatures: ["local-floor"],
       optionalFeatures: ["local", "dom-overlay"],
       domOverlay: { root: document.getElementById("overlay") }
     });
 
-    session.addEventListener("end", () => {
-      stopAll("xr_session_end_event");
-    });
+    session.addEventListener("end", () => stopAll("xr_session_end_event"));
 
   } catch (e) {
-    // Fallback: if DOM overlay isn't supported, try without it (UI may disappear in immersive)
     log("requestSession with DOM overlay failed: " + e);
     try {
       const supportedAR = await navigator.xr.isSessionSupported("immersive-ar").catch(() => false);
@@ -200,9 +207,7 @@ document.getElementById('start').onclick = async () => {
         optionalFeatures: ["local"]
       });
 
-      session.addEventListener("end", () => {
-        stopAll("xr_session_end_event");
-      });
+      session.addEventListener("end", () => stopAll("xr_session_end_event"));
     } catch (e2) {
       log("Failed to start XR session: " + e2);
       await stopAll("xr_start_failed");
@@ -220,7 +225,7 @@ document.getElementById('start').onclick = async () => {
   }
   session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
 
-  // Ref space: local-floor -> local fallback
+  // Reference space
   let refSpace = await session.requestReferenceSpace("local-floor").catch(() => null);
   if (!refSpace) refSpace = await session.requestReferenceSpace("local").catch(() => null);
   if (!refSpace) {
@@ -232,29 +237,48 @@ document.getElementById('start').onclick = async () => {
   log("Streaming started.");
 
   let sentPose = 0;
+  let frameCount = 0;
+
+  // reset fps meter
+  fpsLast = performance.now();
+  fpsFrames = 0;
+  fpsEma = 60;
+
   function onFrame(t, frame) {
     if (!running || !session) return;
+
+    // FPS meter
+    fpsFrames++;
+    const now = performance.now();
+    if (now - fpsLast >= 1000) {
+      const fps = fpsFrames * 1000 / (now - fpsLast);
+      fpsEma = 0.9 * fpsEma + 0.1 * fps;
+      setStatus(`Running. fps=${fps.toFixed(1)} (ema ${fpsEma.toFixed(1)}) sent=${sentPose}`);
+      fpsFrames = 0;
+      fpsLast = now;
+    }
 
     try {
       const wsOpen = (ws && ws.readyState === WebSocket.OPEN);
       const pose = frame.getViewerPose(refSpace);
 
-      // Always send a frame status packet (even if pose is null)
-      if (wsOpen) {
-        ws.send(JSON.stringify({ type: "frame", t_ms: nowMs(), has_pose: !!pose }));
-      }
-
-      // Send pose when available
       if (pose && wsOpen) {
-        const tr = pose.views[0].transform;
-        ws.send(JSON.stringify({
-          type: "pose",
-          t_ms: nowMs(),
-          pos:  { x: tr.position.x,    y: tr.position.y,    z: tr.position.z },
-          quat: { x: tr.orientation.x, y: tr.orientation.y, z: tr.orientation.z, w: tr.orientation.w }
-        }));
-        sentPose++;
-        if (sentPose % 30 === 0) log("Sent pose frames: " + sentPose);
+        frameCount++;
+
+        // Send at controlled rate for stability
+        if (frameCount % SEND_EVERY_N_FRAMES === 0) {
+          const tr = pose.views[0].transform;
+          ws.send(JSON.stringify({
+            type: "pose",
+            t_ms: nowMs(),
+            pos:  { x: tr.position.x,    y: tr.position.y,    z: tr.position.z },
+            quat: { x: tr.orientation.x, y: tr.orientation.y, z: tr.orientation.z, w: tr.orientation.w }
+          }));
+          sentPose++;
+
+          // Very infrequent logging to avoid DOM overhead
+          if (sentPose % 120 === 0) log("Sent pose frames: " + sentPose);
+        }
       }
 
       session.requestAnimationFrame(onFrame);
