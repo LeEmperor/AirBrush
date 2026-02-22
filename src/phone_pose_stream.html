@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>iPhone WebXR Pose Stream</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; }
+    button { font-size: 16px; padding: 10px 14px; }
+    #log { white-space: pre; background: #111; color: #ddd; padding: 10px; border-radius: 8px; overflow:auto; }
+    input { width: 100%; padding: 8px; margin: 10px 0; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>WebXR Pose → WebSocket</h1>
+
+  <label>WebSocket URL (computer):</label>
+  <input id="wsUrl" value="wss://10.29.177.97:8081/ws" />
+
+  <button id="start">Start XR + Stream</button>
+  <div id="log"></div>
+
+<script>
+const logEl = document.getElementById('log');
+function log(msg) { logEl.textContent = msg + "\n" + logEl.textContent; }
+function nowMs() { return Math.round(performance.now()); }
+
+document.getElementById('start').onclick = async () => {
+  log("Clicked start.");
+
+  if (!navigator.xr) {
+    log("navigator.xr not found. Open this page inside WebXR Viewer.");
+    return;
+  }
+
+  const wsUrl = document.getElementById('wsUrl').value.trim();
+  const ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    log("WebSocket connected: " + wsUrl);
+    ws.send(JSON.stringify({ type: "hello", t_ms: nowMs() }));
+  };
+  ws.onerror = (e) => log("WebSocket error: " + (e?.message || e));
+  ws.onclose = () => log("WebSocket closed");
+
+  // Heartbeat so server always sees traffic
+  setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "heartbeat", t_ms: nowMs() }));
+    }
+  }, 1000);
+
+  // XR session
+  let session;
+  try {
+    const supportedAR = await navigator.xr.isSessionSupported("immersive-ar").catch(() => false);
+    const mode = supportedAR ? "immersive-ar" : "immersive-vr";
+    log("Using XR mode: " + mode);
+
+    session = await navigator.xr.requestSession(mode, {
+      requiredFeatures: ["local-floor"],
+      optionalFeatures: ["local"]
+    });
+  } catch (e) {
+    log("Failed to start XR session: " + e);
+    return;
+  }
+
+  // WebGL baseLayer
+  const canvas = document.createElement("canvas");
+  const gl = canvas.getContext("webgl", { xrCompatible: true });
+  if (!gl) { log("Failed to create WebGL context."); return; }
+  session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+
+  // Ref space: local-floor -> local fallback
+  let refSpace = await session.requestReferenceSpace("local-floor").catch(() => null);
+  if (!refSpace) refSpace = await session.requestReferenceSpace("local").catch(() => null);
+  if (!refSpace) { log("Failed to get reference space."); return; }
+
+  log("Streaming started.");
+
+  let sentPose = 0;
+  function onFrame(t, frame) {
+    try {
+      const wsOpen = (ws.readyState === WebSocket.OPEN);
+      const pose = frame.getViewerPose(refSpace);
+
+      // Always send a frame status packet (even if pose is null)
+      if (wsOpen) {
+        ws.send(JSON.stringify({ type: "frame", t_ms: nowMs(), has_pose: !!pose }));
+      }
+
+      // Send pose when available
+      if (pose && wsOpen) {
+        const tr = pose.views[0].transform;
+        ws.send(JSON.stringify({
+          type: "pose",
+          t_ms: nowMs(),
+          pos:  { x: tr.position.x,    y: tr.position.y,    z: tr.position.z },
+          quat: { x: tr.orientation.x, y: tr.orientation.y, z: tr.orientation.z, w: tr.orientation.w }
+        }));
+        sentPose++;
+        if (sentPose % 30 === 0) log("Sent pose frames: " + sentPose);
+      }
+
+      session.requestAnimationFrame(onFrame);
+    } catch (err) {
+      log("onFrame error: " + err);
+    }
+  }
+
+  session.requestAnimationFrame(onFrame);
+};
+</script>
+</body>
+</html>
