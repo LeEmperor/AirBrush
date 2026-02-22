@@ -1,5 +1,6 @@
 import json
 import inspect
+import math
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import Any, Awaitable, Callable, Optional
 
@@ -100,6 +101,41 @@ class PoseWSHandler:
             print("❌ on_pose error:", repr(e))
             return
 
+def quat_to_rotmat_xyzw(qx: float, qy: float, qz: float, qw: float) -> list[list[float]]:
+    """
+    Quaternion (x,y,z,w) -> 3x3 rotation matrix.
+    """
+    # Normalize (important!)
+    n = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+    if n == 0.0:
+        return [[1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0]]
+    qx, qy, qz, qw = qx/n, qy/n, qz/n, qw/n
+
+    xx, yy, zz = qx*qx, qy*qy, qz*qz
+    xy, xz, yz = qx*qy, qx*qz, qy*qz
+    wx, wy, wz = qw*qx, qw*qy, qw*qz
+
+    return [
+        [1.0 - 2.0*(yy + zz), 2.0*(xy - wz),       2.0*(xz + wy)],
+        [2.0*(xy + wz),       1.0 - 2.0*(xx + zz), 2.0*(yz - wx)],
+        [2.0*(xz - wy),       2.0*(yz + wx),       1.0 - 2.0*(xx + yy)],
+    ]
+
+def pose_to_T_xyzw(px: float, py: float, pz: float, qx: float, qy: float, qz: float, qw: float) -> list[list[float]]:
+    """
+    This returns the Homogeneous 4x4 Transformation matrix
+
+    The 3x3 represents the rotation and the last column represents the affine transformation -> translation
+    """
+    R = quat_to_rotmat_xyzw(qx, qy, qz, qw)
+    return [
+        [R[0][0], R[0][1], R[0][2], px],
+        [R[1][0], R[1][1], R[1][2], py],
+        [R[2][0], R[2][1], R[2][2], pz],
+        [0.0,     0.0,     0.0,     1.0],
+    ]
 
 # ----------------------------
 # Example: define your on_pose
@@ -109,6 +145,7 @@ async def my_pose_action(data: dict[str, Any], ws: WebSocket):
     q = data.get("quat") or {}
 
     # Do anything you want here: write to DB, update global state, broadcast, etc.
+
     print(
         f"t={data.get('t_ms')}  "
         f"pos=({PoseWSHandler.f3(p.get('x'))},{PoseWSHandler.f3(p.get('y'))},{PoseWSHandler.f3(p.get('z'))})  "
@@ -120,6 +157,7 @@ async def my_pose_action(data: dict[str, Any], ws: WebSocket):
 
 
 handler = PoseWSHandler(on_pose=my_pose_action, verbose=True)
+
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
