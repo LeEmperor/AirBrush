@@ -70,19 +70,6 @@ void parseByte(uint8_t b) {
 }
 
 void loop() {
-
-  // Wait for handshake
-  if (!started) {
-    if (MainSerial.available()) {
-      String cmd = MainSerial.readStringUntil('\n');
-      if (cmd == "START") {
-        started = true;
-        Serial.println("Handshake complete. Listening...");
-      }
-    }
-    return;
-  }
-
   while (MainSerial.available()) {
     parseByte(MainSerial.read());
   }
