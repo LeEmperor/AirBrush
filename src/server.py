@@ -1,10 +1,12 @@
 import json
 import inspect
 import math
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import Any, Awaitable, Callable, Optional
 
-
+address = "10.100.100.5"
+address = "forbidden.peanut"
 app = FastAPI()
 
 # A callback type that takes in a dictionary of any and a websocket. It can return any
@@ -29,12 +31,12 @@ class PoseWSHandler:
         self.verbose = verbose
 
     @staticmethod
-    def f3(v):
+    def f3(v) -> float | None:
         """Format float-ish values safely."""
         try:
-            return f"{float(v):.3f}"
+            return float(f"{float(v):.3f}")
         except Exception:
-            return "NA"
+            return None
 
     async def handle(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -73,10 +75,10 @@ class PoseWSHandler:
 
         mtype = data.get("type", "unknown")
 
-        if mtype in ("hello", "heartbeat", "frame"):
-            if self.verbose:
-                print(f"📨 {mtype} t_ms={data.get('t_ms')} has_pose={data.get('has_pose')}")
-            return
+        # if mtype in ("hello", "heartbeat", "frame"):
+        #     if self.verbose:
+        #         print(f"📨 {mtype} t_ms={data.get('t_ms')} has_pose={data.get('has_pose')}")
+        #     return
 
         if mtype == "pose":
             # Call user-provided function
@@ -123,19 +125,19 @@ def quat_to_rotmat_xyzw(qx: float, qy: float, qz: float, qw: float) -> list[list
         [2.0*(xz - wy),       2.0*(yz + wx),       1.0 - 2.0*(xx + yy)],
     ]
 
-def pose_to_T_xyzw(px: float, py: float, pz: float, qx: float, qy: float, qz: float, qw: float) -> list[list[float]]:
+def pose_to_T_xyzw(px: float, py: float, pz: float, qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
     """
     This returns the Homogeneous 4x4 Transformation matrix
 
     The 3x3 represents the rotation and the last column represents the affine transformation -> translation
     """
     R = quat_to_rotmat_xyzw(qx, qy, qz, qw)
-    return [
+    return np.array([
         [R[0][0], R[0][1], R[0][2], px],
         [R[1][0], R[1][1], R[1][2], py],
         [R[2][0], R[2][1], R[2][2], pz],
         [0.0,     0.0,     0.0,     1.0],
-    ]
+    ])
 
 # ----------------------------
 # Example: define your on_pose
@@ -156,7 +158,29 @@ async def my_pose_action(data: dict[str, Any], ws: WebSocket):
     # await ws.send_text(json.dumps({"type": "ack", "t_ms": data.get("t_ms")}))
 
 
-handler = PoseWSHandler(on_pose=my_pose_action, verbose=True)
+async def transform_to_homogenous_matrix(data: dict[str, Any], ws: WebSocket):
+    p = data.get("pos") or {}
+    q = data.get("quat") or {}
+
+    # Do anything you want here: write to DB, update global state, broadcast, etc.
+    qx, qy, qz, qw = PoseWSHandler.f3(q.get('x')), PoseWSHandler.f3(q.get('y')), PoseWSHandler.f3(q.get('z')), PoseWSHandler.f3(q.get('w'))
+    px, py, pz = PoseWSHandler.f3(p.get('x')), PoseWSHandler.f3(p.get('y')), PoseWSHandler.f3(p.get('z'))
+
+    homogenous_m = pose_to_T_xyzw(
+        px=px,
+        py=py,
+        pz=pz,
+        qx=qx,
+        qy=qy,
+        qz=qz,
+        qw=qw
+    )
+
+    # TODO: We need to send this across another websocket instance
+    print(f"t={data.get('t_ms')}  matrix={homogenous_m}")
+
+
+handler = PoseWSHandler(on_pose=transform_to_homogenous_matrix, verbose=False)
 
 
 @app.websocket("/ws")

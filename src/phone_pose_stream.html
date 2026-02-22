@@ -3,27 +3,132 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>iPhone WebXR Pose Stream</title>
+  <title>iPhone WebXR Pose Stream (DOM Overlay)</title>
   <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
+    body { font-family: system-ui, sans-serif; padding: 16px; margin: 0; }
+
     button { font-size: 16px; padding: 10px 14px; }
-    #log { white-space: pre; background: #111; color: #ddd; padding: 10px; border-radius: 8px; overflow:auto; }
-    input { width: 100%; padding: 8px; margin: 10px 0; font-size: 14px; }
+    input { width: 100%; padding: 8px; margin: 10px 0; font-size: 14px; box-sizing: border-box; }
+
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+    #log {
+      white-space: pre;
+      background: #111;
+      color: #ddd;
+      padding: 10px;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 35vh;
+    }
+
+    /* ---- DOM overlay container (sits above immersive AR) ---- */
+    #overlay {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      top: 12px;
+      z-index: 9999;
+
+      /* readable over camera */
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 12px;
+      padding: 12px;
+
+      /* allow tapping */
+      pointer-events: auto;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+
+    #overlay h1 {
+      margin: 0 0 8px 0;
+      font-size: 18px;
+      color: #fff;
+    }
+
+    #overlay label { color: #eee; font-size: 14px; }
+    #status { color: #eee; font-size: 13px; margin-top: 8px; opacity: 0.9; }
+
+    /* If DOM overlay isn't active, this is still just normal page UI */
   </style>
 </head>
 <body>
-  <h1>WebXR Pose → WebSocket</h1>
 
-  <label>WebSocket URL (computer):</label>
-  <input id="wsUrl" value="wss://10.29.177.97:8081/ws" />
+  <!-- This is the root for DOM overlay. In immersive-ar, this stays visible. -->
+  <div id="overlay">
+    <h1>WebXR Pose → WebSocket</h1>
 
-  <button id="start">Start XR + Stream</button>
-  <div id="log"></div>
+    <label>WebSocket URL (computer):</label>
+    <input id="wsUrl" value="wss://10.29.177.97:8081/ws" />
+
+    <div class="row">
+      <button id="start">Start XR + Stream</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+
+    <div id="status">Idle.</div>
+    <div id="log"></div>
+  </div>
 
 <script>
 const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
 function log(msg) { logEl.textContent = msg + "\n" + logEl.textContent; }
+function setStatus(msg) { statusEl.textContent = msg; }
 function nowMs() { return Math.round(performance.now()); }
+
+// ---- state we can clean up on Stop ----
+let ws = null;
+let session = null;
+let gl = null;
+let heartbeatId = null;
+let running = false;
+
+function setUiRunning(isRunning) {
+  running = isRunning;
+  document.getElementById('start').disabled = isRunning;
+  document.getElementById('stop').disabled = !isRunning;
+  setStatus(isRunning ? "Running." : "Idle.");
+}
+
+// Stop everything safely (can be called multiple times)
+async function stopAll(reason = "stop") {
+  log("Stopping: " + reason);
+
+  // stop heartbeat
+  if (heartbeatId !== null) {
+    clearInterval(heartbeatId);
+    heartbeatId = null;
+  }
+
+  // end XR session (releases camera)
+  if (session) {
+    try { await session.end(); } catch (e) {}
+    session = null;
+  }
+
+  // close ws
+  if (ws) {
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "bye", t_ms: nowMs(), reason }));
+      }
+      ws.close();
+    } catch (e) {}
+    ws = null;
+  }
+
+  gl = null;
+  setUiRunning(false);
+  log("Stopped.");
+}
+
+// Stop button
+document.getElementById('stop').onclick = async () => {
+  await stopAll("user_clicked_stop");
+};
 
 document.getElementById('start').onclick = async () => {
   log("Clicked start.");
@@ -33,56 +138,105 @@ document.getElementById('start').onclick = async () => {
     return;
   }
 
+  // If already running, restart cleanly
+  if (running) {
+    await stopAll("restart");
+  }
+
+  setUiRunning(true);
+
+  // ---- WebSocket ----
   const wsUrl = document.getElementById('wsUrl').value.trim();
-  const ws = new WebSocket(wsUrl);
+  ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     log("WebSocket connected: " + wsUrl);
     ws.send(JSON.stringify({ type: "hello", t_ms: nowMs() }));
   };
   ws.onerror = (e) => log("WebSocket error: " + (e?.message || e));
-  ws.onclose = () => log("WebSocket closed");
+  ws.onclose = () => {
+    log("WebSocket closed");
+    // If WS closes unexpectedly, stop XR so camera doesn't stay stuck
+    stopAll("ws_closed");
+  };
 
   // Heartbeat so server always sees traffic
-  setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "heartbeat", t_ms: nowMs() }));
-    }
+  heartbeatId = setInterval(() => {
+    try {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "heartbeat", t_ms: nowMs() }));
+      }
+    } catch (e) {}
   }, 1000);
 
-  // XR session
-  let session;
+  // ---- XR session ----
   try {
     const supportedAR = await navigator.xr.isSessionSupported("immersive-ar").catch(() => false);
     const mode = supportedAR ? "immersive-ar" : "immersive-vr";
     log("Using XR mode: " + mode);
 
+    // Request DOM overlay so the UI stays visible in immersive sessions.
+    // If the runtime doesn't support it, requestSession may fail.
     session = await navigator.xr.requestSession(mode, {
       requiredFeatures: ["local-floor"],
-      optionalFeatures: ["local"]
+      optionalFeatures: ["local", "dom-overlay"],
+      domOverlay: { root: document.getElementById("overlay") }
     });
+
+    session.addEventListener("end", () => {
+      stopAll("xr_session_end_event");
+    });
+
   } catch (e) {
-    log("Failed to start XR session: " + e);
-    return;
+    // Fallback: if DOM overlay isn't supported, try without it (UI may disappear in immersive)
+    log("requestSession with DOM overlay failed: " + e);
+    try {
+      const supportedAR = await navigator.xr.isSessionSupported("immersive-ar").catch(() => false);
+      const mode = supportedAR ? "immersive-ar" : "immersive-vr";
+      log("Retrying without DOM overlay. (UI may not stay visible.)");
+
+      session = await navigator.xr.requestSession(mode, {
+        requiredFeatures: ["local-floor"],
+        optionalFeatures: ["local"]
+      });
+
+      session.addEventListener("end", () => {
+        stopAll("xr_session_end_event");
+      });
+    } catch (e2) {
+      log("Failed to start XR session: " + e2);
+      await stopAll("xr_start_failed");
+      return;
+    }
   }
 
   // WebGL baseLayer
   const canvas = document.createElement("canvas");
-  const gl = canvas.getContext("webgl", { xrCompatible: true });
-  if (!gl) { log("Failed to create WebGL context."); return; }
+  gl = canvas.getContext("webgl", { xrCompatible: true });
+  if (!gl) {
+    log("Failed to create WebGL context.");
+    await stopAll("no_webgl");
+    return;
+  }
   session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
 
   // Ref space: local-floor -> local fallback
   let refSpace = await session.requestReferenceSpace("local-floor").catch(() => null);
   if (!refSpace) refSpace = await session.requestReferenceSpace("local").catch(() => null);
-  if (!refSpace) { log("Failed to get reference space."); return; }
+  if (!refSpace) {
+    log("Failed to get reference space.");
+    await stopAll("no_ref_space");
+    return;
+  }
 
   log("Streaming started.");
 
   let sentPose = 0;
   function onFrame(t, frame) {
+    if (!running || !session) return;
+
     try {
-      const wsOpen = (ws.readyState === WebSocket.OPEN);
+      const wsOpen = (ws && ws.readyState === WebSocket.OPEN);
       const pose = frame.getViewerPose(refSpace);
 
       // Always send a frame status packet (even if pose is null)
@@ -106,6 +260,7 @@ document.getElementById('start').onclick = async () => {
       session.requestAnimationFrame(onFrame);
     } catch (err) {
       log("onFrame error: " + err);
+      stopAll("onFrame_error");
     }
   }
 
