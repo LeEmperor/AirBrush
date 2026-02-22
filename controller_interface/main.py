@@ -83,42 +83,95 @@ class ControllerInterface:
         print("Controller interface stopped.")
 
 
-def main(): 
-    # Parse command-line arguments
+def main():
+    import pygame
+
     parser = argparse.ArgumentParser(description='Controller Interface')
-    parser.add_argument('--port', type=str, default='/dev/ttyUSB0', help='Serial port to connect to the controller')
-    parser.add_argument('--baudrate', type=int, default=115200, help='Baud rate for the serial connection')
+    parser.add_argument('--port', type=str, default='/dev/ttyUSB0')
+    parser.add_argument('--baudrate', type=int, default=115200)
     args = parser.parse_args()
-    
-    # Create a serial connection to the controller
+
     print(f"Connecting to controller on port {args.port} with baudrate {args.baudrate}...")
     controller_interface = ControllerInterface(args.port, args.baudrate)
-
-    # Start the controller interface
     controller_interface.start()
-    print("Press Ctrl+C to stop the controller interface.")
+
+    # --- Pygame setup ---
+    pygame.init()
+    screen = pygame.display.set_mode((400, 200))
+    pygame.display.set_caption("Keyboard Controller")
+    clock = pygame.time.Clock()
+
+    print("Use WASD + Arrow keys. Ctrl+C to quit.")
+
+    # Control state (centered)
+    yaw = 127
+    height = 127
+    forward = 127
+    strafe = 127
+
+    step = 10          # how fast values change
+    return_speed = 8   # how fast they return to center
+
     try:
-        t = 0.0
-        last_time = time.time()
         while True:
-            # Example control values (replace with actual control logic)
-            new_time = time.time()
-            t += 0.1 * (new_time - last_time)
-            control_values = [
-                int((1 + 0.5 * math.sin(t)) * 127),  # yaw (purple) (0-255)
-                int((1 + 0.5 * math.cos(t)) * 127),  # height (blue) (0-255)
-                int((1 + 0.5 * math.sin(2*t)) * 127), # forwards (green) (0-255)
-                int((1 + 0.5 * math.cos(2*t)) * 127)  # strafe (yellow) (0-255)
-            ]
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    raise KeyboardInterrupt
+
+            keys = pygame.key.get_pressed()
+
+            # --- FORWARD (W/S) ---
+            if keys[pygame.K_s]:
+                forward += step
+            elif keys[pygame.K_w]:
+                forward -= step
+            else:
+                forward += (127 - forward) * 0.2
+
+            # --- HEIGHT (UP/DOWN) ---
+            if keys[pygame.K_UP]:
+                height += step
+            elif keys[pygame.K_DOWN]:
+                height -= step
+            else:
+                height += (127 - height) * 0.2
+
+            # --- STRAFE (A/D) ---
+            if keys[pygame.K_d]:
+                strafe += step
+            elif keys[pygame.K_a]:
+                strafe -= step
+            else:
+                strafe += (127 - strafe) * 0.2
+
+            # --- Yaw (LEFT/RIGHT) ---
+            if keys[pygame.K_RIGHT]:
+                yaw += step
+            elif keys[pygame.K_LEFT]:
+                yaw -= step
+            else:
+                yaw += (127 - yaw) * 0.2
+
+            # Clamp to 0–255
+            yaw = int(max(0, min(255, yaw)))
+            height = int(max(0, min(255, height)))
+            forward = int(max(0, min(255, forward)))
+            strafe = int(max(0, min(255, strafe)))
+
+            control_values = [forward, strafe, height, yaw]
+
             controller_interface.control(control_values)
-            print(f"Sent control values: {control_values}")
-            last_time = new_time
-            time.sleep(1)  # Send control values every second
+            print(f"\rSent control values: {control_values}", end="")
+
+            clock.tick(20)  # 20 Hz update rate
+
     except KeyboardInterrupt:
         pass
     finally:
-        print("Stopping controller interface...")
+        print("\nStopping controller interface...")
         controller_interface.stop()
+        pygame.quit()
+
     
 if __name__ == "__main__":
     main()
