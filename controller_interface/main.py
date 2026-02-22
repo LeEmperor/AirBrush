@@ -57,8 +57,9 @@ class ControllerInterface:
             while self.state == ControllerState.ACTIVE:
                 try:
                     packet = self.packet_queue.get(block=True, timeout=1.0)
-                    print(f"Broadcasting packet {{id: {packet[2]}}}")
                     srl.write(packet)
+                    buf = list(bytearray(srl.read(12)))
+                    print(buf) 
                 except queue.Empty:
                     continue
         except Exception as e:
