@@ -1,6 +1,7 @@
 import serial
 import math
 import threading
+import queue
 import struct
 import enum
 import time
@@ -22,9 +23,12 @@ CONTROL_PACKET_ID = 0x01
 
 class ControllerInterface: 
     def __init__(self, port, baudrate): 
-        self.serial = serial.Serial(port, baudrate)
+        self.port = port
+        self.baudrate = baudrate
         self.state = ControllerState.IDLE
+        self.packet_queue = queue.Queue()
         self.heartbeat_thread = threading.Thread(target=self.heartbeat)
+        self.broadcast_thread = threading.Thread(target=self.broadcast) 
         
     def create_packet(self, packet_id: int, payload: bytes) -> bytes:
         match packet_id:
@@ -36,38 +40,46 @@ class ControllerInterface:
         return packet
 
     def heartbeat(self):
-        print(f"Sending heartbeat packet")
         while self.state == ControllerState.ACTIVE:
             heartbeat_packet = self.create_packet(HEARTBEAT_PACKET_ID, b'')
-            self.serial.write(heartbeat_packet)
-        time.sleep(0.25)
+            self.packet_queue.put(heartbeat_packet)
+            time.sleep(0.25)
 
     def control(self, control_values: list[int]):
-        print(f"Sending control values: {control_values}")
         assert len(control_values) == 4, "Control packet should have exactly 4 control values"
         payload = struct.pack('<' + 'B' * len(control_values), *control_values)
         control_packet = self.create_packet(CONTROL_PACKET_ID, payload)
-        self.serial.write(control_packet)
+        self.packet_queue.put(control_packet)
+
+    def broadcast(self):
+        srl = serial.Serial(self.port, self.baudrate)
+        try:
+            while self.state == ControllerState.ACTIVE:
+                try:
+                    packet = self.packet_queue.get(block=True, timeout=1.0)
+                    print(f"Broadcasting packet {{id: {packet[2]}}}")
+                    srl.write(packet)
+                except queue.Empty:
+                    continue
+        except Exception as e:
+            pass
+        finally:
+            srl.close()
         
     def start(self):
         # Start the controller interface
         self.state = ControllerState.ACTIVE
         self.heartbeat_thread.start()
+        self.broadcast_thread.start()
         print("Controller interface started.")
 
     def stop(self):
         # Stop the controller interface
         self.state = ControllerState.IDLE
         self.heartbeat_thread.join()
-        self.serial.close()
+        self.broadcast_thread.join()
         print("Controller interface stopped.")
 
-    def read(self) -> str:
-        # Read data from the serial port
-        if self.serial.in_waiting > 0:
-            data = self.serial.read(self.serial.in_waiting)
-            return data.decode('ascii', errors='ignore')
-        return ''
 
 def main(): 
     # Parse command-line arguments
