@@ -3,55 +3,182 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>iPhone WebXR Pose Stream</title>
+  <title>iPhone WebXR Pose Stream (Launch/Land + Stop)</title>
   <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
+    body { font-family: system-ui, sans-serif; padding: 16px; margin: 0; }
     button { font-size: 16px; padding: 10px 14px; }
-    #log { white-space: pre; background: #111; color: #ddd; padding: 10px; border-radius: 8px; overflow:auto; }
-    input { width: 100%; padding: 8px; margin: 10px 0; font-size: 14px; }
+    input { width: 100%; padding: 8px; margin: 10px 0; font-size: 14px; box-sizing: border-box; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+    #log {
+      white-space: pre;
+      background: #111;
+      color: #ddd;
+      padding: 10px;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 35vh;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    #overlay {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      top: 12px;
+      z-index: 9999;
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 12px;
+      padding: 12px;
+      pointer-events: auto;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+
+    #overlay h1 { margin: 0 0 8px 0; font-size: 18px; color: #fff; }
+    #overlay label { color: #eee; font-size: 14px; }
+    #status { color: #eee; font-size: 13px; margin-top: 8px; opacity: 0.9; }
+    #hint { color: #ddd; font-size: 12px; margin-top: 6px; opacity: 0.85; }
   </style>
 </head>
 <body>
-  <h1>WebXR Pose → WebSocket</h1>
+  <div id="overlay">
+    <h1>WebXR Pose → WebSocket</h1>
 
-  <label>WebSocket URL (computer):</label>
-  <input id="wsUrl" value="wss://10.29.177.97:8081/ws" />
+    <label>WebSocket URL (computer):</label>
+    <input id="wsUrl" value="wss://10.29.177.97:8081/ws" />
 
-  <button id="start">Start XR + Stream</button>
-  <div id="log"></div>
+    <div class="row">
+      <button id="toggle">Launch</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+
+    <div id="status">Idle. Not streaming.</div>
+    <div id="hint">
+      Launch starts streaming + sends one launch event. Land sends one land event (stream continues).
+      Stop ends XR+WS (stops sending).
+    </div>
+    <div id="log"></div>
+  </div>
 
 <script>
 const logEl = document.getElementById('log');
-function log(msg) { logEl.textContent = msg + "\n" + logEl.textContent; }
+const statusEl = document.getElementById('status');
+const toggleBtn = document.getElementById('toggle');
+const stopBtn = document.getElementById('stop');
+
+const LOG_MAX_LINES = 40;
+let logLines = [];
+function log(msg) {
+  logLines.unshift(msg);
+  if (logLines.length > LOG_MAX_LINES) logLines.pop();
+  logEl.textContent = logLines.join("\n");
+}
+function setStatus(msg) { statusEl.textContent = msg; }
 function nowMs() { return Math.round(performance.now()); }
 
-document.getElementById('start').onclick = async () => {
-  log("Clicked start.");
+// ---- state ----
+let ws = null;
+let session = null;
+let gl = null;
+let heartbeatId = null;
+
+let streaming = false; // true once XR+WS are running
+let launched = false;  // only controls the Launch/Land label
+
+// If true, the next frame will NOT send pose (prevents "two packets" on click)
+let skipNextPoseSend = false;
+
+const SEND_EVERY_N_FRAMES = 2;
+
+// FPS meter
+let fpsLast = performance.now();
+let fpsFrames = 0;
+let fpsEma = 60;
+
+function wsOpen() {
+  return ws && ws.readyState === WebSocket.OPEN;
+}
+
+function updateUi() {
+  toggleBtn.textContent = launched ? "Land" : "Launch";
+  stopBtn.disabled = !streaming;
+  if (!streaming) setStatus("Idle. Not streaming.");
+}
+
+function sendEvent(name) {
+  if (!wsOpen()) return;
+  // Ensure the click only emits ONE packet by skipping pose on the immediately-following frame
+  skipNextPoseSend = true;
+  ws.send(JSON.stringify({ type: "event", data: name, t_ms: nowMs() }));
+  log("Event sent: " + name);
+}
+
+async function stopAll(reason = "stop") {
+  log("Stopping: " + reason);
+
+  if (heartbeatId !== null) {
+    clearInterval(heartbeatId);
+    heartbeatId = null;
+  }
+
+  if (session) {
+    try { await session.end(); } catch (e) {}
+    session = null;
+  }
+
+  if (ws) {
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "bye", t_ms: nowMs(), reason }));
+      }
+      ws.close();
+    } catch (e) {}
+    ws = null;
+  }
+
+  gl = null;
+  streaming = false;
+  launched = false;
+  skipNextPoseSend = false;
+  updateUi();
+  log("Stopped.");
+}
+
+async function startStreaming() {
+  log("Launching: starting XR + WebSocket...");
 
   if (!navigator.xr) {
     log("navigator.xr not found. Open this page inside WebXR Viewer.");
+    await stopAll("no_navigator_xr");
     return;
   }
 
+  // ---- WebSocket ----
   const wsUrl = document.getElementById('wsUrl').value.trim();
-  const ws = new WebSocket(wsUrl);
+  ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     log("WebSocket connected: " + wsUrl);
     ws.send(JSON.stringify({ type: "hello", t_ms: nowMs() }));
+    // Send exactly ONE packet here: launch event, and skip pose on the next frame.
+    sendEvent("launch");
   };
   ws.onerror = (e) => log("WebSocket error: " + (e?.message || e));
-  ws.onclose = () => log("WebSocket closed");
+  ws.onclose = () => {
+    log("WebSocket closed");
+    stopAll("ws_closed");
+  };
 
-  // Heartbeat so server always sees traffic
-  setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "heartbeat", t_ms: nowMs() }));
-    }
+  heartbeatId = setInterval(() => {
+    try {
+      if (wsOpen()) ws.send(JSON.stringify({ type: "heartbeat", t_ms: nowMs() }));
+    } catch (e) {}
   }, 1000);
 
-  // XR session
-  let session;
+  // ---- XR session ----
   try {
     const supportedAR = await navigator.xr.isSessionSupported("immersive-ar").catch(() => false);
     const mode = supportedAR ? "immersive-ar" : "immersive-vr";
@@ -59,58 +186,125 @@ document.getElementById('start').onclick = async () => {
 
     session = await navigator.xr.requestSession(mode, {
       requiredFeatures: ["local-floor"],
-      optionalFeatures: ["local"]
+      optionalFeatures: ["local", "dom-overlay"],
+      domOverlay: { root: document.getElementById("overlay") }
     });
+
+    session.addEventListener("end", () => stopAll("xr_session_end_event"));
   } catch (e) {
-    log("Failed to start XR session: " + e);
+    log("requestSession failed: " + e);
+    await stopAll("xr_start_failed");
     return;
   }
 
   // WebGL baseLayer
   const canvas = document.createElement("canvas");
-  const gl = canvas.getContext("webgl", { xrCompatible: true });
-  if (!gl) { log("Failed to create WebGL context."); return; }
+  gl = canvas.getContext("webgl", { xrCompatible: true });
+  if (!gl) {
+    log("Failed to create WebGL context.");
+    await stopAll("no_webgl");
+    return;
+  }
   session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
 
-  // Ref space: local-floor -> local fallback
+  // Reference space
   let refSpace = await session.requestReferenceSpace("local-floor").catch(() => null);
   if (!refSpace) refSpace = await session.requestReferenceSpace("local").catch(() => null);
-  if (!refSpace) { log("Failed to get reference space."); return; }
+  if (!refSpace) {
+    log("Failed to get reference space.");
+    await stopAll("no_ref_space");
+    return;
+  }
 
-  log("Streaming started.");
+  streaming = true;
+  stopBtn.disabled = false;
+  log("Pose streaming started.");
+
+  fpsLast = performance.now();
+  fpsFrames = 0;
+  fpsEma = 60;
 
   let sentPose = 0;
+  let frameCount = 0;
+
   function onFrame(t, frame) {
+    if (!session || !streaming) return;
+
+    fpsFrames++;
+    const now = performance.now();
+    if (now - fpsLast >= 1000) {
+      const fps = fpsFrames * 1000 / (now - fpsLast);
+      fpsEma = 0.9 * fpsEma + 0.1 * fps;
+      setStatus(`Streaming. fps=${fps.toFixed(1)} (ema ${fpsEma.toFixed(1)}) sent=${sentPose}`);
+      fpsFrames = 0;
+      fpsLast = now;
+    }
+
     try {
-      const wsOpen = (ws.readyState === WebSocket.OPEN);
       const pose = frame.getViewerPose(refSpace);
 
-      // Always send a frame status packet (even if pose is null)
-      if (wsOpen) {
-        ws.send(JSON.stringify({ type: "frame", t_ms: nowMs(), has_pose: !!pose }));
-      }
+      if (pose && wsOpen()) {
+        frameCount++;
 
-      // Send pose when available
-      if (pose && wsOpen) {
-        const tr = pose.views[0].transform;
-        ws.send(JSON.stringify({
-          type: "pose",
-          t_ms: nowMs(),
-          pos:  { x: tr.position.x,    y: tr.position.y,    z: tr.position.z },
-          quat: { x: tr.orientation.x, y: tr.orientation.y, z: tr.orientation.z, w: tr.orientation.w }
-        }));
-        sentPose++;
-        if (sentPose % 30 === 0) log("Sent pose frames: " + sentPose);
+        // If a Launch/Land click just happened, skip sending pose for ONE frame.
+        if (skipNextPoseSend) {
+          skipNextPoseSend = false;
+        } else if (frameCount % SEND_EVERY_N_FRAMES === 0) {
+          const tr = pose.views[0].transform;
+          ws.send(JSON.stringify({
+            type: "pose",
+            t_ms: nowMs(),
+            pos:  { x: tr.position.x,    y: tr.position.y,    z: tr.position.z },
+            quat: { x: tr.orientation.x, y: tr.orientation.y, z: tr.orientation.z, w: tr.orientation.w }
+          }));
+          sentPose++;
+          if (sentPose % 240 === 0) log("Sent pose frames: " + sentPose);
+        }
       }
 
       session.requestAnimationFrame(onFrame);
     } catch (err) {
       log("onFrame error: " + err);
+      stopAll("onFrame_error");
     }
   }
 
   session.requestAnimationFrame(onFrame);
+}
+
+// Toggle button:
+// - initial: Launch, nothing sent
+// - click Launch: starts streaming + sends one launch event, label becomes Land
+// - click Land: keeps streaming + sends one land event, label becomes Launch
+toggleBtn.onclick = async () => {
+  toggleBtn.disabled = true;
+  try {
+    if (!streaming) {
+      launched = true; // show Land
+      updateUi();
+      await startStreaming();
+      // if startStreaming failed, stopAll resets state
+    } else {
+      launched = !launched;
+      const evt = launched ? "launch" : "land";
+      sendEvent(evt);
+      updateUi();
+    }
+  } catch (e) {
+    log("Toggle error: " + e);
+  } finally {
+    toggleBtn.disabled = false;
+  }
 };
+
+// Stop button: stop streaming (XR + WS)
+stopBtn.onclick = async () => {
+  stopBtn.disabled = true;
+  await stopAll("user_clicked_stop");
+};
+
+// init
+updateUi();
 </script>
 </body>
 </html>

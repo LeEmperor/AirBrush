@@ -28,5 +28,14 @@ There are multiple steps to run this server properly
       5) Go to **Settings -> General -> VPN & Device Management -> install profile**
       6) Then go to **Settings -> General -> About -> Certificate Trust Settings**
       7) Enable **Full Trust**
-   4) Now we can run WebXR. Type in the web address: 
+   4) Now we can run WebXR. Type in the web address:
       ```https://[IPv4 Address]:8443/phone_pose_stream.html```
+
+# PLEASE READ:
+For people who wants to access data:
+
+First, need to run both file: serve_https.py and server.py. Do this by running the commands above
+
+Second, you need to have XRViewer on your iPhone.
+
+The URL you
