@@ -1,151 +1,133 @@
-#define DAC_1 25
-#define DAC_2 26
-#define LED_BUILTIN 2
-#define TEST_LED 4
-//heartbeat packet:
-//2 byte header + 2 byte ID
-//0 byte payload
-//2 byte ID + 2 byte footer
+#include <Arduino.h>
 
-//control packet
-//2 byte header + 2 byte ID
-//4 byte payload
-//2 byte ID + 2 byte footer
+#define BAUDRATE 115200
 
-const uint16_t heartbeat_id = 0x0000;
-const uint16_t control_id = 0x0001;
-const uint16_t delimiter = 0xF0F0;
-unsigned long last_heartbeat_received_time = 0;
-bool heartbeat_packets_started = false;
+#define PACKET_DELIMITER 0xF0F0
+#define HEARTBEAT_PACKET_ID 0x00
+#define CONTROL_PACKET_ID   0x01
 
-hw_timer_t* Timer0_Cfg = NULL;
+#define DAC1_PIN 25
+#define DAC2_PIN 26
 
-uint8_t raw_buf[12] = {0};
-typedef struct {
-  uint16_t header;
-  uint16_t header_id;
-  uint16_t footer_id;
-  uint16_t footer;
-} HEARTBEAT_PACKET;
+#define MAX_PACKET_SIZE 12   // largest possible packet
 
-typedef struct {
-  uint16_t header;
-  uint16_t header_id;
-  uint8_t payload[4];
-  uint16_t footer_id;
-  uint16_t footer;
-} CONTROL_PACKET;
+enum ParseState {
+  WAIT_HEADER_1,
+  WAIT_HEADER_2,
+  READ_ID_1,
+  READ_ID_2,
+  READ_REST
+};
 
-void ARDUINO_ISR_ATTR watchdogISR() {
-  digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-  if ((last_heartbeat_received_time > 2000) && heartbeat_packets_started == true) {
-    digitalWrite(TEST_LED, !digitalRead(TEST_LED));
+ParseState state = WAIT_HEADER_1;
+
+uint8_t buffer[MAX_PACKET_SIZE];
+uint8_t indexPos = 0;
+uint8_t expectedLength = 0;
+uint16_t packet_id = 0;
+
+void resetParser() {
+  state = WAIT_HEADER_1;
+  indexPos = 0;
+  expectedLength = 0;
+}
+
+void processPacket() {
+  if (packet_id == CONTROL_PACKET_ID) {
+    uint8_t control1 = buffer[4];
+    uint8_t control2 = buffer[5];
+
+    dacWrite(DAC1_PIN, control1);
+    dacWrite(DAC2_PIN, control2);
+
+    Serial.printf("Control1: %d  Control2: %d\n", control1, control2);
   }
-  else if ((last_heartbeat_received_time <= 2000) && heartbeat_packets_started == true) {
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  else if (packet_id == HEARTBEAT_PACKET_ID) {
+    Serial.println("Heartbeat received");
+  }
+}
+
+void parseByte(uint8_t byteIn) {
+
+  switch (state) {
+
+    case WAIT_HEADER_1:
+      if (byteIn == 0xF0) {
+        buffer[0] = byteIn;
+        state = WAIT_HEADER_2;
+      }
+      break;
+
+    case WAIT_HEADER_2:
+      if (byteIn == 0xF0) {
+        buffer[1] = byteIn;
+        state = READ_ID_1;
+      } else {
+        state = WAIT_HEADER_1;
+      }
+      break;
+
+    case READ_ID_1:
+      buffer[2] = byteIn;
+      state = READ_ID_2;
+      break;
+
+    case READ_ID_2:
+      buffer[3] = byteIn;
+      packet_id = buffer[2] | (buffer[3] << 8);
+
+      if (packet_id == HEARTBEAT_PACKET_ID) {
+        expectedLength = 8;
+      }
+      else if (packet_id == CONTROL_PACKET_ID) {
+        expectedLength = 12;
+      }
+      else {
+        resetParser(); // unknown packet
+        break;
+      }
+
+      indexPos = 4;
+      state = READ_REST;
+      break;
+
+    case READ_REST:
+      buffer[indexPos++] = byteIn;
+
+      if (indexPos >= expectedLength) {
+
+        uint16_t footer_id =
+          buffer[expectedLength - 4] |
+          (buffer[expectedLength - 3] << 8);
+
+        uint16_t footer_delim =
+          buffer[expectedLength - 2] |
+          (buffer[expectedLength - 1] << 8);
+
+        if (footer_delim == PACKET_DELIMITER &&
+            footer_id == packet_id) {
+
+          processPacket();
+        }
+
+        resetParser();
+      }
+      break;
   }
 }
 
 void setup() {
-  Serial.begin(115200, SERIAL_8N1);
-  Timer0_Cfg = timerBegin(1000000);
-  pinMode(LED_BUILTIN, OUTPUT);
-  pinMode(TEST_LED, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-  digitalWrite(TEST_LED, LOW);
-  timerAttachInterrupt(Timer0_Cfg, &watchdogISR);
-  timerAlarm(Timer0_Cfg, 1000000, true, 0);
-}
+  Serial.begin(BAUDRATE);
+  delay(1000);
 
-bool all255() {
-  bool allFF = true;
-  for (int i = 0; i < 12; i++) {
-    if (raw_buf[i] != 0xFF) {
-      allFF = false;
-    }
-  }
-  return allFF;
+  pinMode(DAC1_PIN, OUTPUT);
+  pinMode(DAC2_PIN, OUTPUT);
+
+  Serial.println("ESP32 Receiver Ready");
 }
 
 void loop() {
-  int i = 0;
-  while (Serial.available() && i < 12) {
-     char c = Serial.read();
-     raw_buf[i] = c;
-     i++;
+  while (Serial.available()) {
+    parseByte(Serial.read());
   }
-  
-  if (!all255()) {
-    for (int i = 0; i < 12; i++) {
-      Serial.write(raw_buf[i]);
-    }
-  }
-  
-  for (int i = 0; i < 12; i++) {
-      raw_buf[i] = 0xFF;
-  }
-
-  
-
-
-
-  delay(10);
-
-
-//   if (Serial.available()) {
-//     HEARTBEAT_PACKET hb;
-//     CONTROL_PACKET ctrl;
-//     uint8_t temp_header[2];
-//     uint8_t temp_id[2];
-//     Serial.read(temp_header, 4);
-//     if (!(temp_header[0] == 0xF0 && temp_header[1] == 0xF0)) {
-//    //   Serial.println("Invalid packet!");
-//       while(Serial.available()) {
-//         Serial.read();
-//       }
-//     }
-//     else {
-//       Serial.read(temp_id, 4);
-//       if (temp_id[0] == 0x00 && temp_id[1] == 0x00) {
-//         //heartbeat packet
-//         if (heartbeat_packets_started == false) {
-//           heartbeat_packets_started = true;
-//         }
-//         for (int i = 0; i < 2; i++) {
-//           hb.header[i] = temp_header[i];
-//         }
-//         for (int i = 0; i < 2; i++) {
-//           hb.header_id[i] = temp_id[i];
-//         }
-//         Serial.read(hb.footer_id, 2);
-//         Serial.read(hb.footer, 2);
-//         last_heartbeat_received_time = millis();
-
-//         Serial.write(hb.payload, 4);
-//         Serial.write('\n');
-
-//       }
-//       else if (temp_id[0] == 0x01 && temp_id[1] == 0x00) {
-//         for (int i = 0; i < 2; i++) {
-//           ctrl.header[i] = temp_header[i];
-//         }
-//         for (int i = 0; i < 2; i++) {
-//           ctrl.header_id[i] = temp_id[i];
-//         }
-//         Serial.read(ctrl.payload, 4);
-//         Serial.read(ctrl.footer_id, 2);
-//         Serial.read(ctrl.footer, 2);
-
-//         Serial.write(ctrl.payload, 4);
-//         Serial.write('\n');
-
-//       }
-//     else {
-//  //     Serial.println("Invalid packet id!");
-//       while(Serial.available()) {
-//         Serial.read();
-//       }
-//     }
-//   }
-//   }
 }
