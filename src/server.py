@@ -3,6 +3,7 @@ import inspect
 import json
 import math
 import struct
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, Callable
 
@@ -10,6 +11,8 @@ import numpy as np
 import zmq
 import zmq.asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, StreamingResponse
+
 
 PoseCallback = Callable[[dict[str, Any], WebSocket], Any]
 
@@ -179,3 +182,61 @@ handler = PoseWSHandler(on_pose=transform_to_homogenous_matrix, verbose=False)
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await handler.handle(ws)
+
+
+app = FastAPI()
+latest_frame: bytes | None = None
+
+HTML = """<!DOCTYPE html>
+<html>
+<body>
+<video id="v" autoplay playsinline></video>
+<canvas id="c" hidden></canvas>
+<script>
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}/camera`);
+const v = document.getElementById('v');
+const c = document.getElementById('c');
+
+navigator.mediaDevices.getUserMedia({video: true}).then(s => {
+  v.srcObject = s;
+  v.onloadedmetadata = () => {
+    c.width = v.videoWidth;
+    c.height = v.videoHeight;
+    setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      c.getContext('2d').drawImage(v, 0, 0);
+      c.toBlob(b => b.arrayBuffer().then(a => ws.send(a)), 'image/jpeg', 0.8);
+    }, 50);
+  };
+});
+</script>
+</body>
+</html>"""
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML
+
+@app.websocket("/camera")
+async def ws_endpoint(websocket: WebSocket):
+    global latest_frame
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            latest_frame = data
+            # with open("/tmp/frame.jpg", "wb") as f:
+            #     f.write(data)
+    except Exception:
+        pass
+
+async def mjpeg_stream():
+    while True:
+        if latest_frame:
+            yield b"--f\r\nContent-Type: image/jpeg\r\n\r\n" + latest_frame + b"\r\n"
+        await asyncio.sleep(0.033)
+
+@app.get("/stream")
+async def stream():
+    return StreamingResponse(mjpeg_stream(), media_type="multipart/x-mixed-replace; boundary=f")

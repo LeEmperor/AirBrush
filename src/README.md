@@ -30,3 +30,6 @@ There are multiple steps to run this server properly
       7) Enable **Full Trust**
    4) Now we can run WebXR. Type in the web address: 
       ```https://[IPv4 Address]:8443/phone_pose_stream.html```
+
+# PLEASE READ:
+For people who wants to access this data
