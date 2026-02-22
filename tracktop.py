@@ -2,6 +2,7 @@ import cv2
 import math
 import numpy as np
 from controller import ControllerInterface
+from src.ipc import IPC
 
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) # Windows specific
 
@@ -18,6 +19,12 @@ state = dict(
 
 controller = ControllerInterface('COM14', 115200)
 controller.start()
+
+ipc = IPC()
+ipc.start()
+
+POSE_MAX_AGE_MS = 200  # if pose older than this, treat as absent
+
 
 while True:
     ret, frame = cap.read()
@@ -87,6 +94,16 @@ while True:
         pos_y = (y - frame_h // 2) * pos_z * 0.05
         pos_x *= -1
         pos_y *= -1
+
+        t = ipc.get_latest_translation(max_age_ms=POSE_MAX_AGE_MS)
+        if t is not None:
+            tx, ty, tz = t
+            pos_x += tx
+            pos_y += ty
+            pos_z += tz
+        else:
+            tx = ty = tz = 0.0
+
         yaw = state["heading"]
         pos = pos_x, pos_y, pos_z
         # print("%0.2f %0.2f %0.2f" % pos)
@@ -105,6 +122,7 @@ while True:
 
         cv2.drawContours(frame_show, [box], 0, (0,0,255), 2)
         cv2.line(frame_show, pt1, pt2, (0, 255, 0), 2)
+
 
 
 
