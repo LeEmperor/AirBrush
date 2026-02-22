@@ -1,0 +1,13 @@
+Project Name: 
+Project Tracks: 
+  Seeed Studio
+    - Interactive Signage Track?
+
+Tool Tracks:
+  MLH - best use of gemini API
+
+
+
+NOTE: CHANGE THE ELEVATOR PITCH
+
+
