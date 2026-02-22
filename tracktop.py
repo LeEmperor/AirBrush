@@ -88,7 +88,7 @@ while True:
         state["heading"] = cand_heading[np.argmin(err)]
 
         # calculate 3d position
-        wavg = ~(w + h) * 0.5
+        wavg = (w + h) * 0.5
         pos_z = (wavg - 40) / 40 * 0.5
         pos_x = (x - frame_w // 2) * pos_z * 0.05
         pos_y = (y - frame_h // 2) * pos_z * 0.05
@@ -110,7 +110,7 @@ while True:
         rot = np.array([[np.cos(yaw),np.sin(yaw)],[-np.sin(yaw), np.cos(yaw)]])
         pos_2d = rot @ np.array([pos_x, pos_y]) 
 
-        controls = [remap(pos_2d[1], -0.75, 0.75), remap(-pos_2d[0],-0.75, 0.75), remap(-pos_z, -0.75, 0.75), remap(yaw, -math.pi/4, math.pi/4)]
+        controls = [remap(pos_2d[1], -0.75, 0.75), remap(-pos_2d[0],-0.75, 0.75), remap(-pos_z, -0.75, 0.75), remap(yaw, -math.pi/2, math.pi/2)]
         controller.control(controls)
         print("Controls:", controls)
 
