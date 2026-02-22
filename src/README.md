@@ -32,4 +32,10 @@ There are multiple steps to run this server properly
       ```https://[IPv4 Address]:8443/phone_pose_stream.html```
 
 # PLEASE READ:
-For people who wants to access this data
+For people who wants to access data:
+
+First, need to run both file: serve_https.py and server.py. Do this by running the commands above
+
+Second, you need to have XRViewer on your iPhone.
+
+The URL you 

@@ -184,7 +184,6 @@ async def ws_endpoint(ws: WebSocket):
     await handler.handle(ws)
 
 
-app = FastAPI()
 latest_frame: bytes | None = None
 
 HTML = """<!DOCTYPE html>
